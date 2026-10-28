@@ -1,0 +1,19 @@
+{
+    "models": {
+        "Driving_License": {
+            "type": "detection",
+            "path": "models/Driving_License.pt",
+            "classes": [
+                "Address",
+                "Blood Group",
+                "DL No",
+                "DOB",
+                "Name",
+                "Relation With",
+                "RTO",
+                "State",
+                "Vehicle Type"
+            ]
+        }
+    }
+}
