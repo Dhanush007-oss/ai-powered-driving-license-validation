@@ -869,6 +869,10 @@ with gr.Blocks(
         elem_id="site-footer",
     )
 
-
 if __name__ == "__main__":
-    demo.queue().launch(inbrowser=True, show_error=True)
+    demo.queue().launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", "10000")),
+        inbrowser=False,
+        show_error=True,
+    )
