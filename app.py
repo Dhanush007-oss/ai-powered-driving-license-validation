@@ -1,5 +1,16 @@
 import html
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["FLAGS_num_threads"] = "1"
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+import cv2
+cv2.setNumThreads(1)
 import re
 
 import gradio as gr
