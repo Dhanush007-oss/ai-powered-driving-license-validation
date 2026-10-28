@@ -368,7 +368,8 @@ def unblur_image(image):
 
 
 def denoise_image(image):
-    return cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 15)
+    # OPTIMIZED: Replaced slow fastNlMeansDenoisingColored with fast bilateral filter to prevent CPU freeze
+    return cv2.bilateralFilter(image, d=5, sigmaColor=50, sigmaSpace=50)
 
 
 def enhance_contrast(image):
@@ -381,7 +382,11 @@ def enhance_contrast(image):
 
 def preprocess_image(image):
     bounded = cap_image_resolution(image, max_dim=1200)
-    image = upscale_image(bounded, scale=2)
+    h, w = bounded.shape[:2]
+    if max(h, w) < 900:
+        image = upscale_image(bounded, scale=2)
+    else:
+        image = bounded
     image = unblur_image(image)
     image = denoise_image(image)
     image = enhance_contrast(image)
@@ -920,7 +925,9 @@ def extract_license_ocr_fields(image):
         )
         and not (category == "TR" and re.search(r"\bNON[ -]*TRANSPORT\b", line["text"], re.I))
     })
-    if not output_fields.get("Date of Issue") or not output_fields.get("Date of First Issue"):
+    
+    # OPTIMIZED: Only run vertical OCR when "Date of Issue" itself is missing (avoids redundant 4-strip passes)
+    if not output_fields.get("Date of Issue"):
         try:
             vertical = read_vertical_issue_fields(image)
         except Exception as exc:
