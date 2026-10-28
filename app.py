@@ -868,11 +868,16 @@ with gr.Blocks(
         """,
         elem_id="site-footer",
     )
+import os
 
 if __name__ == "__main__":
+    # Retrieve the port assigned by the hosting environment, defaulting to 7860 for local testing
+    port = int(os.environ.get("PORT", 7860))
+    
+    # Launch Gradio bound to 0.0.0.0 so external web traffic and the platform port scanner can reach it
     demo.queue().launch(
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", "10000")),
-        inbrowser=False,
-        show_error=True,
+        server_name="0.0.0.0", 
+        server_port=port, 
+        inbrowser=False, 
+        show_error=True
     )
