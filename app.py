@@ -1,16 +1,5 @@
 import html
 import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["FLAGS_num_threads"] = "1"
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-
-import cv2
-cv2.setNumThreads(1)
 import re
 
 import gradio as gr
@@ -137,39 +126,32 @@ def render_results(fields, assessment):
     """
 
 
-def validate_licence_ui(front_image, back_image, category_selection):
-    if front_image is None:
-        return "NOT VALID | Error: Please upload an image first.", None, {"error": "No image provided"}
-    
-    try:
-        print("Starting backend inference...", flush=True)
-        payload = {
-            "front": front_image,
-            "back": back_image,
-            "category": category_selection if category_selection else "Automatic"
-        }
-        
-        # Call your inference engine safely
-        fields, annotated_image, assessment = process_driving_license(payload, save_json=False)
-        status_msg = assessment.get("message", "Processing complete.")
-        print("Backend inference completed successfully!", flush=True)
-        return status_msg, annotated_image, fields
-        
-    except Exception as e:
-        print(f"CRITICAL BACKEND ERROR: {str(e)}", flush=True)
-        import traceback
-        traceback.print_exc()
-        return f"NOT VALID | Backend Error: {str(e)}", front_image, {"error": str(e)}
+def validate_licence(image):
+    if image is None or (isinstance(image, dict) and image.get("front") is None and image.get("back") is None):
+        return None, render_results({}, {
+            "status": "NOT VALID",
+            "message": "NOT VALID | Error (Image Not Uploaded): No driving licence photo was uploaded. | How to fix: Upload a clear, upright horizontal photo of your driving licence, including the side showing its validity date.",
+        })
+
+    fields, annotated, assessment = process_driving_license(image)
+
+    print("\n--- DATE EXTRACTION DEBUG ---")
+    print("Full OCR:", fields.get("Full Image OCR"))
+    print("Detected dates:", fields.get("Detected Dates"))
+    print("Validity categories:", fields.get("Validity Categories"))
+    print("NT expiry:", fields.get("Valid Till (NT)"))
+    print("TR expiry:", fields.get("Valid Till (TR)"))
+    print("Date of issue:", fields.get("Date of Issue"))
+    print("Field review:", fields.get("Field Review"))
+    print("Reason codes:", assessment.get("reason_codes"))
+    print("Assessment:", assessment.get("message"))
+    print("--- END DEBUG ---\n")
+
+    return annotated, render_results(fields, assessment)
 
 
 def validate_uploaded_licence(image, reverse_image, category):
-    status_msg, annotated, fields = validate_licence_ui(image, reverse_image, category)
-    if isinstance(fields, dict) and "error" in fields and len(fields) == 1:
-        assessment = {"status": "NOT VALID", "message": status_msg}
-        fields = {}
-    else:
-        assessment = {"status": "VALID" if "valid" in status_msg.lower() and "not valid" not in status_msg.lower() else "NOT VALID", "message": status_msg}
-    return annotated, render_results(fields, assessment)
+    return validate_licence({"front": image, "back": reverse_image, "category": category})
 
 
 def clear_licence():
@@ -889,9 +871,4 @@ with gr.Blocks(
 
 
 if __name__ == "__main__":
-    demo.queue().launch(
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", "10000")),
-        inbrowser=False,
-        show_error=True,
-    )
+    demo.queue().launch(inbrowser=True, show_error=True)

@@ -5,7 +5,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import threading
 from datetime import date, datetime
 
 import cv2
@@ -27,25 +26,27 @@ logger = logging.getLogger(__name__)
 logging.getLogger("ultralytics").setLevel(logging.WARNING)
 
 HF_REPO = "logasanjeev/indian-id-validator"
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-
-DL_NUMBER_PATTERN = re.compile(
-    r"\b([A-Z]{2}[-\s/.]?[0-9A-Z]{2,3}[-\s/.]?\d{4}[-\s/.]?\d{5,7})\b",
-    re.IGNORECASE,
-)
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+DL_NUMBER_PATTERN = re.compile(r"\b([A-Z]{2}[-\s]?[0-9A-Z]{2,3}[-\s]?\d{4}[-\s]?\d{5,7})\b", re.IGNORECASE)
 DATE_PATTERN = re.compile(
-    r"(?<!\d)(\d{4}\s*[./-]\s*\d{2}\s*[./-]\s*\d{2}|\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})(?!\d)"
+    r"(?<!\d)(\d{4}\s*-\s*\d{2}\s*-\s*\d{2}|\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})(?!\d)"
 )
 SUPPORTED_STATE_CODES = frozenset(
     "AN AP AR AS BR CH CG DL GA GJ HR HP JK JH KA KL LA LD MP MH MN ML MZ NL OD OR PY PB RJ SK TN TG TS TR DD UK UA UP WB".split()
 )
-DATE_FORMATS = (
-    "%d-%m-%Y",
-    "%Y-%m-%d",
-    "%d %b %Y",
-    "%d %B %Y",
-)
+DATE_FORMATS = ("%d-%m-%Y", "%d/%m-%Y", "%d/%m/%Y", "%d.%m.%Y", "%Y-%m-%d", "%d %b %Y", "%d %B %Y")
 VALID_BLOOD_GROUP_PATTERN = re.compile(r"\b((?:A1B|A2B|AB|A1|A2|B1|A|B|O)\s*[+-])(?![A-Z0-9])", re.I)
+
+
+def parse_licence_date(value):
+    value = re.sub(r"\s*([./-])\s*", r"\1", normalize_field_value(value))
+    for format_string in DATE_FORMATS:
+        try:
+            return datetime.strptime(value, format_string).date()
+        except ValueError:
+            continue
+    return None
+
 
 DISPLAY_FIELDS = [
     "DL No",
@@ -65,111 +66,21 @@ DISPLAY_FIELDS = [
     "Vehicle Type",
 ]
 
-INDIAN_STATES_UTS = (
-    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh", "Goa",
-    "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka", "Kerala",
-    "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram", "Nagaland",
-    "Odisha", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana", "Tripura",
-    "Uttar Pradesh", "Uttarakhand", "West Bengal", "Andaman and Nicobar Islands",
-    "Chandigarh", "Dadra and Nagar Haveli and Daman and Diu", "Delhi",
-    "Jammu and Kashmir", "Ladakh", "Lakshadweep", "Puducherry",
-)
 
-ISSUE_LABEL = re.compile(r"\b(?:date\s+of\s+issue|issue\s+date|date\s+issued|doi)\b", re.I)
-FIRST_ISSUE_LABEL = re.compile(r"\bdate\s+of\s+first\s+issue\b", re.I)
+def load_config(config_path=CONFIG_PATH):
+    if not os.path.exists(config_path):
+        config_path = hf_hub_download(repo_id=HF_REPO, filename="config.json")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-FIELD_LABEL = re.compile(
-    r"\b(?:address|blood\s*(?:group|grp)|bg|[o0]rgan\s*don[oa]r|name|dob|date\s+of\s+birth|"
-    r"birth|issue\s+date|date\s+(?:of\s+)?(?:first\s+)?issue|doi|aed|valid(?:ity|\s+till|\s+from)|"
-    r"expiry|rto|state|vehicle|holder.?s?\s+signature|signature|son|daughter|wife)\b|\bS\s*[/\\]\s*[WD]",
-    re.I,
-)
 
-ADDRESS_BOUNDARY = re.compile(
-    r"\b(?:blood\s*(?:group|grp)|bg|[o0]rgan\s*don[oa]r|dob|date\s+of\s+birth|doi|"
-    r"issue\s+date|date\s+of\s+(?:first\s+)?issue|valid(?:ity|\s+till)|"
-    r"rto|signature|vehicle\s+type|DL\s*(?:No|Number))\b|\b(?:name|state)\s*:",
-    re.I,
-)
-
-DEFAULT_CONFIG = {
-    "models": {
-        "Driving_License": {
-            "path": "models/driving_license_model.pt",
-            "classes": [
-                "Address",
-                "Blood Group",
-                "DL No",
-                "DOB",
-                "Date of Issue",
-                "Name",
-                "Relation With",
-                "RTO",
-                "State",
-                "Valid Till",
-                "Vehicle Type",
-            ],
-        }
-    }
-}
-
-_MODEL_LOCK = threading.RLock()
-_OCR_LOCK = threading.RLock()
-_CONFIG = None
+CONFIG = load_config()
 _OCR = None
 _LICENSE_MODEL = None
 
-PADDLEOCR_VL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vl_runtime")
+PADDLEOCR_VL_DIR = os.path.join(os.path.dirname(__file__), "vl_runtime")
 PADDLEOCR_VL_PYTHON = os.path.join(PADDLEOCR_VL_DIR, ".venv", "Scripts", "python.exe")
-PADDLEOCR_VL_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paddleocr_vl_worker.py")
-
-MAX_PROCESSING_DIMENSION = 2000
-
-
-def normalize_field_value(value):
-    if value is None:
-        return ""
-    cleaned = re.sub(r"\s+", " ", str(value)).strip(" |")
-    if cleaned.lower() in {"no text detected", "none", "null", ""}:
-        return ""
-    return cleaned
-
-
-def parse_licence_date(value):
-    cleaned = normalize_field_value(value)
-    if not cleaned:
-        return None
-    normalized = re.sub(r"\s*[./-]\s*", "-", cleaned)
-    for format_string in DATE_FORMATS:
-        try:
-            return datetime.strptime(normalized, format_string).date()
-        except ValueError:
-            continue
-    return None
-
-
-def load_config(config_path=CONFIG_PATH):
-    global _CONFIG
-    with _MODEL_LOCK:
-        if _CONFIG is not None and config_path == CONFIG_PATH:
-            return _CONFIG
-        resolved_path = config_path
-        if not os.path.exists(resolved_path):
-            try:
-                resolved_path = hf_hub_download(repo_id=HF_REPO, filename="config.json")
-            except Exception as exc:
-                logger.warning("Could not download config.json (%s); using default config.", exc)
-                _CONFIG = DEFAULT_CONFIG
-                return _CONFIG
-        try:
-            with open(resolved_path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                if config_path == CONFIG_PATH:
-                    _CONFIG = loaded
-                return loaded
-        except Exception as exc:
-            logger.warning("Failed to load config.json (%s); using default config.", exc)
-            return DEFAULT_CONFIG
+PADDLEOCR_VL_WORKER = os.path.join(os.path.dirname(__file__), "paddleocr_vl_worker.py")
 
 
 def _save_image_safely(image, path):
@@ -182,7 +93,7 @@ def _save_image_safely(image, path):
     if hasattr(image, "save"):
         image.save(path)
         return True
-    if image is not None and isinstance(image, np.ndarray) and image.size > 0:
+    if image is not None and hasattr(image, "shape"):
         return bool(cv2.imwrite(path, image))
     return False
 
@@ -214,14 +125,12 @@ def read_paddleocr_vl_lines(images):
         command = [
             PADDLEOCR_VL_PYTHON,
             PADDLEOCR_VL_WORKER,
-            "--output",
-            output_path,
-            "--images",
-            *image_paths,
+            "--output", output_path,
+            "--images", *image_paths,
         ]
         completed = subprocess.run(
             command,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            cwd=os.path.dirname(__file__),
             env=environment,
             capture_output=True,
             text=True,
@@ -241,7 +150,7 @@ def read_paddleocr_vl_lines(images):
 def _date_candidates_for_lines(recognized_lines):
     candidates = []
     for line in recognized_lines:
-        text = str(line.get("text", ""))
+        text = line.get("text", "")
         text_len = max(1, len(text))
         line_left = float(line.get("left", 0.0))
         line_right = float(line.get("right", line_left))
@@ -264,13 +173,13 @@ def _date_candidates_for_lines(recognized_lines):
                 "prefix": prefix,
                 "suffix": text[match.end():],
                 "confidence": line.get("confidence", 0.95),
-                "engine": line.get("engine", "paddleocr"),
+                "engine": line.get("engine", "paddleocr_vl"),
             })
     return candidates
 
 
 def _should_run_paddleocr_vl(fields, assessment):
-    """Bypass the heavy Vision-Language model by default to guarantee a fast response time."""
+    """Bypass the heavy Vision-Language model entirely to guarantee a 2-second response time."""
     return False
 
 
@@ -313,53 +222,36 @@ def _apply_paddleocr_vl_expiry(fields, images):
 
 def get_ocr():
     global _OCR
-    with _OCR_LOCK:
-        if _OCR is None:
-            try:
-                _OCR = PaddleOCR(
-                    use_angle_cls=True,
-                    lang="en",
-                    show_log=False,
-                    enable_mkldnn=False,
-                )
-            except TypeError:
-                _OCR = PaddleOCR(lang="en")
-        return _OCR
+    if _OCR is None:
+        try:
+            _OCR = PaddleOCR(
+                use_angle_cls=True,
+                lang="en",
+                show_log=False,
+                enable_mkldnn=False,
+            )
+        except TypeError:
+            _OCR = PaddleOCR(lang="en")
+    return _OCR
 
 
 def load_license_model():
     global _LICENSE_MODEL
-    with _MODEL_LOCK:
-        if _LICENSE_MODEL is not None:
-            return _LICENSE_MODEL
-
-        cfg = load_config()
-        model_path = cfg["models"]["Driving_License"]["path"]
-        local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), model_path)
-        if os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
-            model_path = local_path
-        else:
-            model_path = hf_hub_download(repo_id=HF_REPO, filename=model_path)
-        _LICENSE_MODEL = YOLO(model_path)
+    if _LICENSE_MODEL is not None:
         return _LICENSE_MODEL
 
-
-def cap_image_resolution(image, max_dim=MAX_PROCESSING_DIMENSION):
-    h, w = image.shape[:2]
-    longest = max(h, w)
-    if longest <= max_dim:
-        return image
-    scale = max_dim / float(longest)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    model_path = CONFIG["models"]["Driving_License"]["path"]
+    local_path = os.path.join(os.path.dirname(__file__), model_path)
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
+        model_path = local_path
+    else:
+        model_path = hf_hub_download(repo_id=HF_REPO, filename=model_path)
+    _LICENSE_MODEL = YOLO(model_path)
+    return _LICENSE_MODEL
 
 
 def upscale_image(image, scale=2):
-    h, w = image.shape[:2]
-    if max(h, w) >= 1600:
-        return image
-    return cv2.resize(image, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+    return cv2.resize(image, (image.shape[1] * scale, image.shape[0] * scale), interpolation=cv2.INTER_CUBIC)
 
 
 def unblur_image(image):
@@ -368,8 +260,7 @@ def unblur_image(image):
 
 
 def denoise_image(image):
-    # OPTIMIZED: Replaced slow fastNlMeansDenoisingColored with fast bilateral filter to prevent CPU freeze
-    return cv2.bilateralFilter(image, d=5, sigmaColor=50, sigmaSpace=50)
+    return cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
 
 
 def enhance_contrast(image):
@@ -381,48 +272,32 @@ def enhance_contrast(image):
 
 
 def preprocess_image(image):
-    bounded = cap_image_resolution(image, max_dim=1200)
-    h, w = bounded.shape[:2]
-    if max(h, w) < 900:
-        image = upscale_image(bounded, scale=2)
-    else:
-        image = bounded
+    image = upscale_image(image, scale=2)
     image = unblur_image(image)
     image = denoise_image(image)
     image = enhance_contrast(image)
     return image
 
 
-def read_image(image_input, assume_rgb_array=True):
+def read_image(image_input):
     """Read image into standard BGR format without destructive blind rotation."""
-    if isinstance(image_input, (str, os.PathLike)):
-        path_str = str(image_input)
-        if not os.path.isfile(path_str):
-            raise ValueError(f"Failed to load image: {path_str}")
-        image = cv2.imread(path_str)
-        if image is None or image.size == 0:
-            raise ValueError(f"Failed to load image: {path_str}")
-        return cap_image_resolution(image)
+    if isinstance(image_input, str):
+        image = cv2.imread(image_input)
+        if image is None:
+            raise ValueError(f"Failed to load image: {image_input}")
+        return image
 
     if not isinstance(image_input, np.ndarray) or image_input.size == 0:
         raise ValueError("A valid driving licence image is required.")
 
     image = image_input
-    if image.dtype != np.uint8:
-        image = np.clip(image, 0, 255).astype(np.uint8)
-
     if image.ndim == 2:
-        bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    elif image.ndim == 3 and image.shape[2] == 1:
-        bgr = cv2.cvtColor(image[:, :, 0], cv2.COLOR_GRAY2BGR)
-    elif image.ndim == 3 and image.shape[2] == 4:
-        bgr = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR if assume_rgb_array else cv2.COLOR_BGRA2BGR)
-    elif image.ndim == 3 and image.shape[2] == 3:
-        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR) if assume_rgb_array else image.copy()
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
     else:
-        raise ValueError(f"Unsupported image array shape: {image.shape}")
-
-    return cap_image_resolution(bgr)
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    return image
 
 
 def extract_text_from_ocr(ocr_result):
@@ -440,25 +315,11 @@ def extract_text_from_ocr(ocr_result):
     return " ".join(extracted_text) if extracted_text else "No text detected"
 
 
-def nearby_value(label, candidate):
-    if label is candidate:
-        return True
-    dx, dy = candidate["x"] - label["x"], candidate["y"] - label["y"]
-    return (
-        (candidate["left"] >= label["right"] - 0.02 and 0 <= dx <= 0.44 and abs(dy) <= 0.048)
-        or (0 < dy <= 0.095 and abs(candidate["left"] - label["left"]) <= 0.16)
-    )
-
-
 def find_nt_expiry(recognized_lines, date_candidates, category="NT", excluded_dates=None):
     excluded_dates = set(excluded_dates or ())
     validity = re.compile(r"\b(valid(?:ity|\s*(?:till|upto|up\s+to|until|through))|expiry|expires)\b", re.I)
-    nt = re.compile(
-        r"(?:\b|\()(?:NT|NON[ -]*TRANSPORT)(?:\b|\))"
-        if category == "NT"
-        else r"(?:\b|\()(?:T|TR|TRANSPORT)(?:\b|\))",
-        re.I,
-    )
+    nt = re.compile(r"(?:\b|\()(?:NT|NON[ -]*TRANSPORT)(?:\b|\))" if category == "NT"
+                    else r"(?:\b|\()(?:T|TR|TRANSPORT)(?:\b|\))", re.I)
     other_field = re.compile(r"\b(issue|issued|doi|aed|birth|dob|valid\s+from)\b", re.I)
     categories = re.compile(r"(?:\b|\()(?:NT|NON[ -]*TRANSPORT|TR|T|TRANSPORT)(?:\b|\))", re.I)
     standalone = re.compile(r"[\s():;,.\[\]-]*(?:" + categories.pattern + r")[\s():;,.\[\]-]*", re.I)
@@ -468,9 +329,6 @@ def find_nt_expiry(recognized_lines, date_candidates, category="NT", excluded_da
         if not match:
             return ""
         return "NT" if re.search(r"(?:NT|NON[ -]*TRANSPORT)", match.group(), re.I) else "TR"
-
-    def distance(first, second):
-        return (first["x"] - second["x"]) ** 2 + (first["y"] - second["y"]) ** 2
 
     def eligible(candidate):
         if candidate["date"] in excluded_dates:
@@ -504,6 +362,9 @@ def find_nt_expiry(recognized_lines, date_candidates, category="NT", excluded_da
     def confident(*items):
         return all(item.get("confidence") is not None and item["confidence"] >= 0.45 for item in items)
 
+    def distance(first, second):
+        return (first["x"] - second["x"]) ** 2 + (first["y"] - second["y"]) ** 2
+
     validity_labels = [line for line in recognized_lines if validity.search(line["text"])]
     anchors = []
     for line in recognized_lines:
@@ -517,27 +378,21 @@ def find_nt_expiry(recognized_lines, date_candidates, category="NT", excluded_da
         ):
             anchors.append(line)
 
-    owners = [
-        line for line in recognized_lines
-        if validity.search(line["text"]) or other_field.search(line["text"]) or categories.search(line["text"])
-    ]
-    category_owners = [
-        owner for owner in owners
-        if not (
-            validity.search(owner["text"])
-            and not re.search(r"(?:\b|\()(?:NT|T|TR|TRANSPORT|NON[ -]*TRANSPORT)(?:\b|\))", owner["text"], re.I)
-        )
-    ]
-    matches = [
-        (candidate["date"], confident(candidate))
-        for candidate in date_candidates
-        if eligible(candidate) and suffix_category(candidate) == category
-    ]
+    owners = [line for line in recognized_lines if validity.search(line["text"])
+              or other_field.search(line["text"])
+              or categories.search(line["text"])]
+    category_owners = [owner for owner in owners if not (
+        validity.search(owner["text"])
+        and not re.search(r"(?:\b|\()(?:NT|T|TR|TRANSPORT|NON[ -]*TRANSPORT)(?:\b|\))", owner["text"], re.I)
+    )]
+    matches = [(candidate["date"], confident(candidate)) for candidate in date_candidates
+               if eligible(candidate) and suffix_category(candidate) == category]
     for anchor in anchors:
-        if any(candidate["source_text"] == anchor["text"] and suffix_category(candidate) for candidate in date_candidates):
+        if any(candidate["source_text"] == anchor["text"] and suffix_category(candidate)
+               for candidate in date_candidates):
             continue
         has_heading = validity.search(anchor["text"]) or any(
-            abs(anchor["x"] - label["x"]) <= 0.25 and abs(anchor["y"] - label["y"]) <= 0.16
+            abs(anchor["x"] - label["x"]) <= .25 and abs(anchor["y"] - label["y"]) <= .16
             for label in validity_labels
         )
         preceding = []
@@ -547,14 +402,11 @@ def find_nt_expiry(recognized_lines, date_candidates, category="NT", excluded_da
             dx, dy = candidate["x"] - anchor["x"], candidate["y"] - anchor["y"]
             same_box = candidate["source_text"] == anchor["text"]
             before_suffix = standalone.fullmatch(anchor["text"]) and (
-                (-0.32 <= dx < 0 and abs(dy) <= 0.035)
-                or (-0.08 <= dy < 0 and abs(dx) <= 0.14)
+                (-.32 <= dx < 0 and abs(dy) <= .035)
+                or (-.08 <= dy < 0 and abs(dx) <= .14)
             )
-            after_label = has_heading and (
-                same_box
-                or (0 <= dx <= 0.32 and abs(dy) <= 0.045)
-                or (0 < dy <= 0.16 and abs(dx) <= 0.14)
-            )
+            after_label = has_heading and (same_box or (0 <= dx <= .32 and abs(dy) <= .045)
+                                          or (0 < dy <= .16 and abs(dx) <= .14))
             if not (before_suffix or after_label):
                 continue
             if not same_box and any(
@@ -568,14 +420,12 @@ def find_nt_expiry(recognized_lines, date_candidates, category="NT", excluded_da
                 matches.append((candidate["date"], confident(anchor, candidate)))
         if preceding:
             nearest = min(distance(anchor, candidate) for candidate in preceding)
-            matches.extend(
-                (candidate["date"], confident(anchor, candidate))
-                for candidate in preceding
-                if abs(distance(anchor, candidate) - nearest) <= 1e-9
-            )
+            matches.extend((candidate["date"], confident(anchor, candidate)) for candidate in preceding
+                           if abs(distance(anchor, candidate) - nearest) <= 1e-9)
 
     values = {value for value, _ in matches}
     if len(values) > 1:
+        # When an issue date and future expiry date both sit under a combined header row, pick the future expiry date
         today = date.today()
         future_vals = [v for v in values if (parse_licence_date(v) or today) > today]
         if len(future_vals) == 1:
@@ -595,8 +445,7 @@ def read_ocr_lines(image):
         raise ValueError("A valid licence image is required.")
 
     image_height, image_width = image.shape[:2]
-    with _OCR_LOCK:
-        ocr_result = get_ocr().ocr(image, cls=True)
+    ocr_result = get_ocr().ocr(image, cls=True)
     if not ocr_result:
         return []
 
@@ -620,18 +469,18 @@ def read_ocr_lines(image):
                 continue
             try:
                 score = float(entry[1][1])
-                score = float(score) if np.isfinite(score) and 0 <= score <= 1 else None
+                score = score if np.isfinite(score) and 0 <= score <= 1 else None
             except (IndexError, TypeError, ValueError):
                 score = None
             recognized_lines.append({
                 "text": text,
                 "confidence": score,
-                "left": float(min(x_values) / max(image_width, 1)),
-                "right": float(max(x_values) / max(image_width, 1)),
-                "top": float(min(y_values) / max(image_height, 1)),
-                "bottom": float(max(y_values) / max(image_height, 1)),
-                "x": float(sum(x_values) / len(x_values) / max(image_width, 1)),
-                "y": float(sum(y_values) / len(y_values) / max(image_height, 1)),
+                "left": min(x_values) / max(image_width, 1),
+                "right": max(x_values) / max(image_width, 1),
+                "top": min(y_values) / max(image_height, 1),
+                "bottom": max(y_values) / max(image_height, 1),
+                "x": sum(x_values) / len(x_values) / max(image_width, 1),
+                "y": sum(y_values) / len(y_values) / max(image_height, 1),
             })
 
     if not recognized_lines:
@@ -640,8 +489,34 @@ def read_ocr_lines(image):
     return sorted(recognized_lines, key=lambda line: (line["y"], line["x"]))
 
 
+INDIAN_STATES_UTS = (
+    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh", "Goa",
+    "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka", "Kerala",
+    "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram", "Nagaland",
+    "Odisha", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana", "Tripura",
+    "Uttar Pradesh", "Uttarakhand", "West Bengal", "Andaman and Nicobar Islands",
+    "Chandigarh", "Dadra and Nagar Haveli and Daman and Diu", "Delhi",
+    "Jammu and Kashmir", "Ladakh", "Lakshadweep", "Puducherry",
+)
+ISSUE_LABEL = re.compile(r"\b(?:date\s+of\s+issue|issue\s+date|date\s+issued|doi)\b", re.I)
+FIRST_ISSUE_LABEL = re.compile(r"\bdate\s+of\s+first\s+issue\b", re.I)
+
+FIELD_LABEL = re.compile(
+    r"\b(?:address|blood\s*(?:group|grp)|bg|[o0]rgan\s*don[oa]r|name|dob|date\s+of\s+birth|"
+    r"birth|issue\s+date|date\s+(?:of\s+)?(?:first\s+)?issue|doi|aed|valid(?:ity|\s+till|\s+from)|"
+    r"expiry|rto|state|vehicle|holder.?s?\s+signature|signature|son|daughter|wife)\b|\bS\s*[/\\]\s*[WD]",
+    re.I,
+)
+
+ADDRESS_BOUNDARY = re.compile(
+    r"\b(?:blood\s*(?:group|grp)|bg|[o0]rgan\s*don[oa]r|dob|date\s+of\s+birth|doi|"
+    r"issue\s+date|date\s+of\s+(?:first\s+)?issue|valid(?:ity|\s+till)|"
+    r"rto|signature|vehicle\s+type|DL\s*(?:No|Number))\b|\b(?:name|state)\s*:", re.I,
+)
+
+
 def extract_state(text):
-    text = str(text or "").replace("&", " and ")
+    text = str(text).replace("&", " and ")
     found = []
     for state in sorted(INDIAN_STATES_UTS, key=len, reverse=True):
         pattern = r"\b" + r"\s*".join(re.escape(word) for word in state.split()) + r"\b"
@@ -652,10 +527,18 @@ def extract_state(text):
     return found[0] if len(set(found)) == 1 else ""
 
 
+def nearby_value(label, candidate):
+    if label is candidate:
+        return True
+    dx, dy = candidate["x"] - label["x"], candidate["y"] - label["y"]
+    return ((candidate["left"] >= label["right"] - .02 and 0 <= dx <= .44 and abs(dy) <= .048)
+            or (0 < dy <= .09 and abs(candidate["left"] - label["left"]) <= .15))
+
+
 def choose_field(output, field, candidates):
     if not candidates:
         return
-    values = {value for value, _ in candidates if value}
+    values = {value for value, _ in candidates}
     if len(values) == 1 and any(confident for _, confident in candidates):
         output[field] = next(iter(values))
     else:
@@ -671,43 +554,19 @@ def extract_labelled_fields(lines):
         if FIELD_LABEL.search(line["text"]) and not re.search(r"\bsignature\b", line["text"], re.I)
     ]
     specs = {
-        "DL No": (
-            re.compile(r"^(?:DL\s*(?:No\.?|Number)|licen[cs]e\s*(?:No\s*\.?|Number))[\s:.-]*", re.I),
-            r"[A-Z]{2}[A-Z0-9 /-]{5,25}",
-        ),
-        "Name": (
-            re.compile(r"^(?:name(?:\s+of\s+(?:the\s+)?holder)?|holder[’']?s?\s+name)[\s:.-]*", re.I),
-            r"[A-Z][A-Z .’'-]{1,79}",
-        ),
-        "Valid Till": (
-            re.compile(
-                r"\b(?:valid\s*(?:till|upto|up\s+to|until|through)|validity|expiry\s+date|date\s+of\s+expiry|expires)[\s:.-]*",
-                re.I,
-            ),
-            DATE_PATTERN.pattern,
-        ),
-        "Blood Group": (
-            re.compile(r"\b(?:blood\s*(?:group|grp)|bg)[\s:.-]*", re.I),
-            r"(?:A1B|A2B|AB|A1|A2|B1|A|B|O)\s*[+-]",
-        ),
-        "Organ Donor": (
-            re.compile(r"\b[o0]rgan\s*don[oa]r[\s:.-]*", re.I),
-            r"(?:YES|NO|Y|N)",
-        ),
-        "DOB": (
-            re.compile(r"\b(?:DOB|date\s+of\s+birth|birth\s+date)[\s:.-]*", re.I),
-            DATE_PATTERN.pattern,
-        ),
+        "DL No": (re.compile(r"^(?:DL\s*(?:No\.?|Number)|licen[cs]e\s*(?:No\.?|Number))\s*[:.-]?", re.I), r"[A-Z]{2}[A-Z0-9 /-]{5,25}"),
+        "Name": (re.compile(r"^(?:name(?:\s+of\s+(?:the\s+)?holder)?|holder[’']?s?\s+name)\s*[:.-]?", re.I), r"[A-Z][A-Z .’'-]{1,79}"),
+        "Valid Till": (re.compile(r"\b(?:valid\s+(?:till|upto|up\s+to|until|through)|validity|expiry\s+date|date\s+of\s+expiry|expires)\b\s*[:.-]?", re.I), DATE_PATTERN.pattern),
+        "Blood Group": (re.compile(r"\b(?:blood\s*(?:group|grp)|bg)\b\s*[:.-]?", re.I), r"(?:A1B|A2B|AB|A1|A2|B1|A|B|O)\s*[+-]"),
+        "Organ Donor": (re.compile(r"\b[o0]rgan\s*don[oa]r\b\s*[:.-]?", re.I), r"(?:YES|NO|Y|N)"),
+        "DOB": (re.compile(r"\b(?:DOB|date\s+of\s+birth|birth\s+date)\b\s*[:.-]?", re.I), DATE_PATTERN.pattern),
         "Date of Issue": (ISSUE_LABEL, DATE_PATTERN.pattern),
         "Date of First Issue": (FIRST_ISSUE_LABEL, DATE_PATTERN.pattern),
     }
-
     for field, (pattern, value_pattern) in specs.items():
         candidates = []
         scores = []
         min_conf = 0.45 if field in ("DL No", "Name", "DOB") else 0.30
-        is_date_field = field.startswith("Date") or field in ("Valid Till", "DOB")
-
         for label in lines:
             match = pattern.search(label["text"])
             if not match:
@@ -718,69 +577,53 @@ def extract_labelled_fields(lines):
                 if not nearby_value(label, line):
                     continue
                 if line is not label:
-                    if FIELD_LABEL.search(line["text"]) or re.search(
-                        r"(?:\b|\()(?:NT|TR|T|TRANSPORT)(?:\b|\))", line["text"], re.I
-                    ):
+                    if FIELD_LABEL.search(line["text"]) or re.search(r"(?:\b|\()(?:NT|TR|T|TRANSPORT)(?:\b|\))", line["text"], re.I):
                         continue
-                    if any(
-                        owner is not label
-                        and nearby_value(owner, line)
-                        and abs(owner["x"] - line["x"]) + abs(owner["y"] - line["y"])
-                        < abs(label["x"] - line["x"]) + abs(label["y"] - line["y"])
-                        for owner in labels
-                    ):
+                    if any(owner is not label and nearby_value(owner, line)
+                           and abs(owner["x"] - line["x"]) + abs(owner["y"] - line["y"])
+                           < abs(label["x"] - line["x"]) + abs(label["y"] - line["y"])
+                           for owner in labels):
                         continue
                 text = label["text"][match.end():].lstrip(" :.-") if line is label else line["text"]
                 next_label = FIELD_LABEL.search(text)
                 if next_label:
                     text = text[:next_label.start()]
-
                 value_match = re.fullmatch(r"\s*(" + value_pattern + r")\s*[;:]*\s*", text, re.I)
-                if not value_match and is_date_field:
-                    date_matches = list(DATE_PATTERN.finditer(text))
-                    if len(date_matches) == 1:
-                        value_match = date_matches[0]
-                    elif len(date_matches) > 1:
-                        if field == "Date of Issue" and abs(line["left"] - label["left"]) <= 0.16:
-                            value_match = date_matches[0]
-                        elif field == "Valid Till":
-                            value_match = date_matches[-1]
-
+                if not value_match and field == "Date of Issue":
+                    # On tabular cards where 2 dates sit on the row below Issue Date & Validity(NT), take the first date
+                    first_date_m = DATE_PATTERN.search(text)
+                    if first_date_m and abs(line["left"] - label["left"]) <= 0.12:
+                        value_match = first_date_m
                 if not value_match:
                     continue
                 value = value_match.group(1)
-                if is_date_field:
+                if field.startswith("Date") or field in ("Valid Till", "DOB"):
                     parsed_date = parse_licence_date(value)
                     if parsed_date is None:
-                        output.setdefault("Field Review", []).append(
-                            f"{field}: invalid calendar date. Upload a clearer image."
-                        )
+                        output.setdefault("Field Review", []).append(f"{field}: invalid calendar date. Upload a clearer image.")
                         continue
                     value = parsed_date.strftime("%d-%m-%Y")
                 elif field not in ("Name", "DL No"):
                     value = re.sub(r"\s+", "", value.upper())
-                confident = all(
-                    item.get("confidence") is not None and item["confidence"] >= min_conf for item in (label, line)
-                )
+                confident = all(item.get("confidence") is not None and item["confidence"] >= min_conf
+                                for item in (label, line))
                 candidates.append((value, confident))
                 actual_scores = [item.get("confidence") for item in (label, line)]
                 scores.append((value, min(actual_scores) if None not in actual_scores else None))
-
         choose_field(output, field, candidates)
         if field in ("Name", "DL No") and output.get(field):
             supporting = [score for value, score in scores if value == output[field] and score is not None]
             output.setdefault("Field Confidence", {})[field] = max(supporting) if supporting else None
 
-    if not output.get("DL No"):
+    if "DL No" not in output:
         numbers = []
         number_scores = []
         for label in lines:
             match = specs["DL No"][0].search(label["text"])
             if not match:
-                dl_m = DL_NUMBER_PATTERN.search(label["text"])
-                if dl_m:
+                if DL_NUMBER_PATTERN.fullmatch(label["text"]):
                     score = label.get("confidence")
-                    numbers.append((dl_m.group(1), score is not None and score >= 0.45))
+                    numbers.append((label["text"], score is not None and score >= .45))
                     number_scores.append(score)
                 continue
             fragments = [label["text"][match.end():].strip(" :.-")]
@@ -795,13 +638,11 @@ def extract_labelled_fields(lines):
             if len(re.sub(r"[ -]", "", value)) >= 8:
                 scores = [line.get("confidence") for line in used]
                 score = min(scores) if None not in scores else None
-                numbers.append((value, score is not None and score >= 0.45))
+                numbers.append((value, score is not None and score >= .45))
                 number_scores.append(score)
         choose_field(output, "DL No", numbers)
         if output.get("DL No"):
-            output.setdefault("Field Confidence", {})["DL No"] = max(
-                (score for score in number_scores if score is not None), default=None
-            )
+            output.setdefault("Field Confidence", {})["DL No"] = max((score for score in number_scores if score is not None), default=None)
 
     addresses = []
     for label in lines:
@@ -820,18 +661,18 @@ def extract_labelled_fields(lines):
         for line in lines:
             if boundary:
                 break
-            if line is label or line["y"] < label["y"] - 0.015:
+            if line is label or line["y"] < label["y"] - .015:
                 continue
             if line["y"] == label["y"] and line["left"] < label["right"]:
                 continue
-            same_row = abs(line["y"] - previous_y) <= 0.015
-            continues_row = same_row and -0.02 <= line["left"] - previous_right <= 0.22
-            aligned = min(abs(line["left"] - label["left"]), abs(line["left"] - address_left)) <= 0.14
+            same_row = abs(line["y"] - previous_y) <= .015
+            continues_row = same_row and -.02 <= line["left"] - previous_right <= .22
+            aligned = min(abs(line["left"] - label["left"]), abs(line["left"] - address_left)) <= .14
             if not (continues_row or aligned):
                 continue
-            if line["bottom"] - line["top"] > 0.12:
+            if line["bottom"] - line["top"] > .12:
                 continue
-            if line["y"] - previous_y > 0.075 or ADDRESS_BOUNDARY.search(line["text"]):
+            if line["y"] - previous_y > .075 or ADDRESS_BOUNDARY.search(line["text"]):
                 break
             if not parts:
                 address_left = line["left"]
@@ -840,14 +681,13 @@ def extract_labelled_fields(lines):
             previous_y = line["y"]
             previous_right = line["right"]
         if parts:
-            addresses.append(
-                (" ".join(parts), all(line.get("confidence") is not None and line["confidence"] >= 0.40 for line in used))
-            )
+            addresses.append((" ".join(parts), all(line.get("confidence") is not None
+                                                  and line["confidence"] >= .40 for line in used)))
     choose_field(output, "Address", addresses)
 
     states = []
     for line in lines:
-        if not re.search(r"\b(?:government|govt|state|union\s+territory|driving\s+licen[cs]e)\b", line["text"], re.I):
+        if not re.search(r"\b(?:government|govt|state|union\s+territory)\b", line["text"], re.I):
             continue
         context = line["text"]
         used = [line]
@@ -858,43 +698,30 @@ def extract_labelled_fields(lines):
                     used.append(following)
         state = extract_state(context)
         if state:
-            states.append((state, all(item.get("confidence") is not None and item["confidence"] >= 0.40 for item in used)))
+            states.append((state, all(item.get("confidence") is not None and item["confidence"] >= .40 for item in used)))
     choose_field(output, "State", states)
     return output
 
 
 def read_vertical_issue_fields(image):
     height, width = image.shape[:2]
-    edge_width = max(1, round(width * 0.18))
-    bands = [
-        cv2.rotate(strip, direction)
-        for strip in (image[:, :edge_width], image[:, -edge_width:])
-        for direction in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    ]
+    edge_width = max(1, round(width * .18))
+    bands = [cv2.rotate(strip, direction)
+             for strip in (image[:, :edge_width], image[:, -edge_width:])
+             for direction in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE)]
     gap = 24
-    band_stride = edge_width + gap
-    canvas_h = 4 * band_stride
-    canvas = np.full((canvas_h, height, 3), 255, dtype=np.uint8)
+    canvas = np.full((4 * (edge_width + gap), height, 3), 255, dtype=np.uint8)
     for index, band in enumerate(bands):
-        top = index * band_stride
+        top = index * (edge_width + gap)
         canvas[top:top + edge_width] = band
     lines = read_ocr_lines(canvas)
     candidates = {"Date of Issue": [], "Date of First Issue": []}
     reviews = []
     for index in range(4):
-        top_px = index * band_stride
-        bottom_px = top_px + edge_width
-        band_lines = []
-        for line in lines:
-            y_px = line["y"] * canvas_h
-            if top_px <= y_px < bottom_px:
-                rescaled = dict(line)
-                rescaled["y"] = float((y_px - top_px) / max(edge_width, 1))
-                rescaled["top"] = float(max(0.0, (line["top"] * canvas_h - top_px) / max(edge_width, 1)))
-                rescaled["bottom"] = float(min(1.0, (line["bottom"] * canvas_h - top_px) / max(edge_width, 1)))
-                band_lines.append(rescaled)
+        top, bottom = index * (edge_width + gap), index * (edge_width + gap) + edge_width
+        band_lines = [line for line in lines if top <= line["y"] * canvas.shape[0] < bottom]
         fields = extract_labelled_fields(band_lines)
-        reviews.extend(note for note in fields.get("Field Review", []) if str(note).startswith("Date"))
+        reviews.extend(note for note in fields.get("Field Review", []) if note.startswith("Date"))
         for field in candidates:
             if fields.get(field):
                 candidates[field].append((fields[field], True))
@@ -912,22 +739,14 @@ def extract_license_ocr_fields(image):
     output_fields["Full Image OCR"] = " | ".join(line["text"] for line in recognized_lines)
     output_fields["OCR Detections"] = recognized_lines
     output_fields["Validity Categories"] = sorted({
-        category
-        for category, pattern in (
-            ("NT", r"(?:\b|\()(?:NT|NON[ -]*TRANSPORT)(?:\b|\))"),
-            ("TR", r"(?:\b|\()(?:TR|T|TRANSPORT)(?:\b|\))"),
-        )
+        category for category, pattern in (("NT", r"(?:\b|\()(?:NT|NON[ -]*TRANSPORT)(?:\b|\))"), ("TR", r"(?:\b|\()(?:TR|T|TRANSPORT)(?:\b|\))"))
         for line in recognized_lines
         if re.search(pattern, line["text"], re.I)
-        and (
-            re.search(r"\b(?:valid|validity|expiry|expires)\b", line["text"], re.I)
-            or re.fullmatch(r"[\s():-]*(?:NT|T|TR|TRANSPORT|NON[ -]*TRANSPORT)[\s():-]*", line["text"], re.I)
-        )
+        and (re.search(r"\b(?:valid|validity|expiry|expires)\b", line["text"], re.I)
+             or re.fullmatch(r"[\s():-]*(?:NT|T|TR|TRANSPORT|NON[ -]*TRANSPORT)[\s():-]*", line["text"], re.I))
         and not (category == "TR" and re.search(r"\bNON[ -]*TRANSPORT\b", line["text"], re.I))
     })
-    
-    # OPTIMIZED: Only run vertical OCR when "Date of Issue" itself is missing (avoids redundant 4-strip passes)
-    if not output_fields.get("Date of Issue"):
+    if not output_fields.get("Date of Issue") or not output_fields.get("Date of First Issue"):
         try:
             vertical = read_vertical_issue_fields(image)
         except Exception as exc:
@@ -935,9 +754,9 @@ def extract_license_ocr_fields(image):
             vertical = {}
         output_fields.setdefault("Field Review", []).extend(vertical.pop("Field Review", []))
         for field, value in vertical.items():
-            if field not in output_fields or not output_fields.get(field):
+            if field not in output_fields:
                 output_fields[field] = value
-            elif value and output_fields[field] != value:
+            elif not value or (output_fields[field] and output_fields[field] != value):
                 choose_field(output_fields, field, [(output_fields[field], True), (value, True)])
 
     date_candidates = _date_candidates_for_lines(recognized_lines)
@@ -952,9 +771,7 @@ def extract_license_ocr_fields(image):
     } - {""}
 
     for category in ("NT", "TR"):
-        expiry, review = find_nt_expiry(
-            recognized_lines, date_candidates, category=category, excluded_dates=excluded_dates
-        )
+        expiry, review = find_nt_expiry(recognized_lines, date_candidates, category=category, excluded_dates=excluded_dates)
         if expiry or review:
             output_fields["Validity Categories"] = sorted(set(output_fields["Validity Categories"]) | {category})
         if expiry:
@@ -965,41 +782,19 @@ def extract_license_ocr_fields(image):
             else:
                 output_fields["TR Expiry Review"] = review
                 output_fields.setdefault("Field Review", []).append(review)
-
-    # Universal Fallback: Map generic Valid Till or remaining post-issue date to Valid Till (NT)
-    if not output_fields.get("Valid Till (NT)") and not output_fields.get("Valid Till (TR)"):
-        generic_vt = normalize_field_value(output_fields.get("Valid Till"))
-        if generic_vt and generic_vt not in excluded_dates:
-            output_fields["Valid Till (NT)"] = generic_vt
-            output_fields.pop("NT Expiry Review", None)
-        else:
-            issue_dt = parse_licence_date(output_fields.get("Date of Issue")) or parse_licence_date(
-                output_fields.get("Date of First Issue")
-            )
-            dob_dt = parse_licence_date(output_fields.get("DOB"))
-            remaining = []
-            for cand in date_candidates:
-                d_str = cand["date"]
-                if d_str in excluded_dates:
-                    continue
-                parsed_d = parse_licence_date(d_str)
-                if not parsed_d:
-                    continue
-                if issue_dt and parsed_d > issue_dt:
-                    remaining.append((parsed_d, d_str))
-                elif not issue_dt and dob_dt and (parsed_d.year - dob_dt.year) >= 18:
-                    remaining.append((parsed_d, d_str))
-            if remaining:
-                remaining.sort(key=lambda item: item[0])
-                inferred_expiry = remaining[-1][1]
-                output_fields["Valid Till"] = inferred_expiry
-                output_fields["Valid Till (NT)"] = inferred_expiry
-                output_fields.pop("NT Expiry Review", None)
-
     validity_dates = [output_fields[key] for key in ("Valid Till (NT)", "Valid Till (TR)") if output_fields.get(key)]
     if validity_dates:
         output_fields["Valid Till Dates"] = list(dict.fromkeys(validity_dates))
     return output_fields
+
+
+def normalize_field_value(value):
+    if not value:
+        return ""
+    cleaned = re.sub(r"\s+", " ", str(value)).strip(" |")
+    if cleaned.lower() in {"no text detected", ""}:
+        return ""
+    return cleaned
 
 
 def assess_nt_expiry(fields, today=None):
@@ -1008,23 +803,22 @@ def assess_nt_expiry(fields, today=None):
     review = fields.get("NT Expiry Review")
     if review:
         return {"expiry_status": "review", "expiry_message": str(review), "expiry_date": value}
-    expiry = parse_licence_date(value)
+    expiry = None
+    for format_string in ("%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            expiry = datetime.strptime(value, format_string).date()
+            break
+        except ValueError:
+            continue
     if expiry is None:
-        return {
-            "expiry_status": "review",
-            "expiry_date": value,
-            "expiry_message": "Valid Till (NT) is missing or unreadable. Upload a clearer photo showing the NT expiry date.",
-        }
+        return {"expiry_status": "review", "expiry_date": value,
+                "expiry_message": "Valid Till (NT) is missing or unreadable. Upload a clearer photo showing the NT expiry date."}
     expired = expiry < today
-    return {
-        "expiry_status": "expired" if expired else "valid",
-        "expiry_date": expiry.isoformat(),
-        "expiry_message": (
-            f"NT expiry date: {expiry:%d-%m-%Y}. "
-            + ("The non-transport validity has expired." if expired else "The non-transport validity has not expired.")
-            + f" Checked on {today:%d-%m-%Y}; based on NT expiry only."
-        ),
-    }
+    return {"expiry_status": "expired" if expired else "valid", "expiry_date": expiry.isoformat(),
+            "expiry_message": (f"NT expiry date: {expiry:%d-%m-%Y}. "
+                               + ("The non-transport validity has expired." if expired
+                                  else "The non-transport validity has not expired.")
+                               + f" Checked on {today:%d-%m-%Y}; based on NT expiry only.")}
 
 
 def assess_applicable_expiry(fields, today=None):
@@ -1038,12 +832,10 @@ def assess_licence(fields, today=None):
 
 
 def _process_licence_image(image_input):
-    image = image_input if (isinstance(image_input, np.ndarray) and image_input.ndim == 3) else read_image(image_input)
+    image = read_image(image_input)
     model = load_license_model()
-    cfg = load_config()
-    class_names = cfg["models"]["Driving_License"]["classes"]
-    with _MODEL_LOCK:
-        results = model(image)
+    class_names = CONFIG["models"]["Driving_License"]["classes"]
+    results = model(image)
     output_image = image.copy()
     h, w, _ = output_image.shape
     filtered_boxes = {}
@@ -1055,7 +847,7 @@ def _process_licence_image(image_input):
             cls = int(box.cls[0].item())
             if cls >= len(class_names):
                 continue
-            conf = float(box.conf[0].item())
+            conf = box.conf[0].item()
             xyxy = box.xyxy[0].tolist()
             class_name = class_names[cls]
             if cls not in filtered_boxes or conf > filtered_boxes[cls]["conf"]:
@@ -1067,33 +859,20 @@ def _process_licence_image(image_input):
         class_name = data["class_name"]
         x_min, y_min = max(0, x_min), max(0, y_min)
         x_max, y_max = min(w, x_max), min(h, y_max)
-
-        # Expand horizontal crop margin slightly for DL No so leading state letters (e.g., 'DL') are never clipped
-        crop_x_min = max(0, x_min - int(0.08 * w)) if class_name == "DL No" else x_min
-        crop_x_max = min(w, x_max + int(0.04 * w)) if class_name == "DL No" else x_max
-        region_img = image[y_min:y_max, crop_x_min:crop_x_max]
+        region_img = image[y_min:y_max, x_min:x_max]
         if region_img.size == 0:
             continue
 
+        # Read clean upscaled crop first to preserve word spacing; fallback to heavy filter only if empty
         clean_crop = cv2.copyMakeBorder(
-            upscale_image(region_img, scale=2),
-            12,
-            12,
-            12,
-            12,
-            cv2.BORDER_CONSTANT,
-            value=(255, 255, 255),
+            upscale_image(region_img, scale=2), 12, 12, 12, 12,
+            cv2.BORDER_CONSTANT, value=(255, 255, 255),
         )
         crop_lines = read_ocr_lines(clean_crop)
         if not crop_lines:
             filtered_crop = cv2.copyMakeBorder(
-                preprocess_image(region_img),
-                12,
-                12,
-                12,
-                12,
-                cv2.BORDER_CONSTANT,
-                value=(255, 255, 255),
+                preprocess_image(region_img), 12, 12, 12, 12,
+                cv2.BORDER_CONSTANT, value=(255, 255, 255),
             )
             crop_lines = read_ocr_lines(filtered_crop)
 
@@ -1127,7 +906,7 @@ def _process_licence_image(image_input):
 
         elif class_name in ("DL No", "Name"):
             raw_text = re.sub(
-                r"^(?:DL\s*(?:No\s*\.?|Number)|licen[cs]e\s*(?:No\s*\.?|Number)|Name(?:\s+of\s+(?:the\s+)?holder)?)[\s:.-]*",
+                r"^(?:DL\s*(?:No\.?|Number)|licen[cs]e\s*(?:No\.?|Number)|Name(?:\s+of\s+(?:the\s+)?holder)?)\s*[:.-]?\s*",
                 "",
                 raw_text,
                 flags=re.I,
@@ -1137,9 +916,7 @@ def _process_licence_image(image_input):
                 if dl_m:
                     raw_text = dl_m.group(1)
             scores = [line.get("confidence") for line in crop_lines]
-            detected_text.setdefault("Field Confidence", {})[class_name] = (
-                min(scores) if scores and None not in scores else None
-            )
+            detected_text.setdefault("Field Confidence", {})[class_name] = min(scores) if scores and None not in scores else None
 
         if raw_text:
             detected_text[class_name] = raw_text
@@ -1162,31 +939,15 @@ def _process_licence_image(image_input):
         for k, v in full_image_fields.pop("Field Confidence", {}).items():
             if v is not None:
                 crop_confidence[k] = max(v, crop_confidence.get(k) or 0.0)
-
+        # Never overwrite a valid YOLO crop extraction with an empty string ""
         for k, v in full_image_fields.items():
-            if k == "DL No":
-                crop_dl = normalize_field_value(detected_text.get("DL No"))
-                full_dl = normalize_field_value(v)
-                if crop_dl and DL_NUMBER_PATTERN.search(crop_dl):
-                    continue
-                if full_dl and DL_NUMBER_PATTERN.search(full_dl):
-                    detected_text["DL No"] = full_dl
-                    continue
-                full_ocr_match = DL_NUMBER_PATTERN.search(str(full_image_fields.get("Full Image OCR", "")))
-                if full_ocr_match:
-                    detected_text["DL No"] = full_ocr_match.group(1)
-                    continue
             if v or k not in detected_text or not detected_text.get(k):
                 detected_text[k] = v
         detected_text["Field Confidence"] = crop_confidence
     except Exception:
         logger.exception("Full-image licence OCR failed")
 
-    state_extracted = (
-        extract_state(detected_text.get("State", ""))
-        or extract_state(detected_text.get("Address", ""))
-        or extract_state(detected_text.get("Full Image OCR", ""))
-    )
+    state_extracted = extract_state(detected_text.get("State", "")) or extract_state(detected_text.get("Full Image OCR", ""))
     detected_text["State"] = state_extracted
     annotated_rgb = cv2.cvtColor(output_image, cv2.COLOR_BGR2RGB)
     return detected_text, annotated_rgb
@@ -1197,30 +958,19 @@ def weak_field_read(fields, field):
     notes = [str(note) for note in fields.get("Field Review", []) if str(note).startswith(field + ":")]
     if field.startswith("Valid Till ("):
         notes.append(str(fields.get("NT Expiry Review" if "(NT)" in field else "TR Expiry Review", "")))
-    return score is None or score < 0.45 or any("low" in note.lower() or "unavailable" in note.lower() for note in notes)
+    return score is None or score < .45 or any("low" in note.lower() or "unavailable" in note.lower() for note in notes)
 
 
 def merge_licence_fields(current, incoming, is_retry=False):
-    core = {
-        "DL No",
-        "Name",
-        "DOB",
-        "Date of Issue",
-        "Date of First Issue",
-        "Valid Till (NT)",
-        "Valid Till (TR)",
-        "Valid Till (T)",
-        "Valid Till",
-    }
+    core = {"DL No", "Name", "DOB", "Date of Issue", "Date of First Issue",
+            "Valid Till (NT)", "Valid Till (TR)", "Valid Till (T)", "Valid Till"}
     protected = {
-        field
-        for field in core
-        if current.get(field) and not weak_field_read(current, field) and (is_retry or weak_field_read(incoming, field))
+        field for field in core
+        if current.get(field) and not weak_field_read(current, field)
+        and (is_retry or weak_field_read(incoming, field))
     }
     protected_notes = {"NT Expiry Review" for field in protected if field == "Valid Till (NT)"}
-    protected_notes.update(
-        "TR Expiry Review" for field in protected if field in ("Valid Till (TR)", "Valid Till (T)")
-    )
+    protected_notes.update("TR Expiry Review" for field in protected if field in ("Valid Till (TR)", "Valid Till (T)"))
     attempts = current.setdefault("OCR Attempts", [])
     if incoming.get("Full Image OCR"):
         attempts.append(incoming["Full Image OCR"])
@@ -1232,11 +982,7 @@ def merge_licence_fields(current, incoming, is_retry=False):
             continue
         if key == "Field Review":
             for note in value:
-                target = (
-                    "OCR Diagnostics"
-                    if (is_retry or any(str(note).startswith(field + ":") for field in protected))
-                    else key
-                )
+                target = "OCR Diagnostics" if (is_retry or any(str(note).startswith(field + ":") for field in protected)) else key
                 if note not in current.get(target, []):
                     current.setdefault(target, []).append(note)
             continue
@@ -1248,9 +994,6 @@ def merge_licence_fields(current, incoming, is_retry=False):
             new = normalize_field_value(value).upper()
             if key == "DL No":
                 old, new = re.sub(r"[ -]", "", old), re.sub(r"[ -]", "", new)
-                if not re.match(r"^[A-Z]{2}", old) and re.match(r"^[A-Z]{2}", new):
-                    current[key] = value
-                    continue
             elif key.startswith("Date") or key.startswith("Valid Till") or key == "DOB":
                 old, new = parse_licence_date(old), parse_licence_date(new)
             if old != new and not weak_field_read(current, key):
@@ -1259,9 +1002,7 @@ def merge_licence_fields(current, incoming, is_retry=False):
                 current[key] = ""
                 current.setdefault("Field Review", []).append(f"{key}: conflicting OCR reads. Upload a clearer image.")
                 if key.startswith("Valid Till ("):
-                    current["NT Expiry Review" if "(NT)" in key else "TR Expiry Review"] = (
-                        "Conflicting expiry dates. Upload a clearer image."
-                    )
+                    current["NT Expiry Review" if "(NT)" in key else "TR Expiry Review"] = "Conflicting expiry dates. Upload a clearer image."
                 continue
         if key in core and any(str(note).startswith(key + ": conflicting") for note in current.get("Field Review", [])):
             continue
@@ -1277,21 +1018,6 @@ def merge_licence_fields(current, incoming, is_retry=False):
                 if key in incoming.get("Field Confidence", {}):
                     current.setdefault("Field Confidence", {})[key] = incoming["Field Confidence"][key]
     return current
-
-
-class _SafeJSONEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return float(obj)
-        if isinstance(obj, (np.bool_,)):
-            return bool(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, (date, datetime)):
-            return obj.isoformat()
-        return super().default(obj)
 
 
 def process_driving_license(image_input, save_json=False, output_json="detected_license.json"):
@@ -1316,7 +1042,7 @@ def process_driving_license(image_input, save_json=False, output_json="detected_
                 fields["Image Quality Report"] = check_image_quality(image)
                 if fields["Image Quality Report"].get("hard_fail"):
                     break
-            side_fields, side_annotated = _process_licence_image(image)
+            side_fields, side_annotated = _process_licence_image(source)
             available_images.append(image)
             merge_licence_fields(fields, side_fields, is_retry=False)
             if side == "front" or annotated is None:
@@ -1343,7 +1069,7 @@ def process_driving_license(image_input, save_json=False, output_json="detected_
     if (
         available_images
         and not fields.get("Image Quality Report", {}).get("hard_fail")
-        and assessment.get("reason_codes")
+        and assessment["reason_codes"]
         and assessment["reason_codes"][0] in retry_reasons
     ):
         for image in available_images:
@@ -1372,7 +1098,7 @@ def process_driving_license(image_input, save_json=False, output_json="detected_
     fields["Official Portal"] = PARIVAHAN_PORTAL_URL
     if save_json:
         with open(output_json, "w", encoding="utf-8") as output:
-            json.dump(fields, output, indent=4, cls=_SafeJSONEncoder)
+            json.dump(fields, output, indent=4)
     return fields, annotated, assessment
 
 
@@ -1394,4 +1120,4 @@ if __name__ == "__main__":
 
     image_input = {"front": args.image_path, "back": args.reverse_image, "category": args.category}
     result = driving_license(image_input, save_json=args.save_json, output_json=args.output_json)
-    print(json.dumps(result, indent=4, cls=_SafeJSONEncoder))
+    print(json.dumps(result, indent=4))
