@@ -25,7 +25,6 @@ def _format_links(text):
 
 
 def _build_message_spotlight(status, raw_message):
-    """Render the user-friendly message in a dedicated visual spotlight card above the table."""
     parts = [part.strip() for part in str(raw_message or "").split("|") if part.strip()]
     title = "Card Validity Confirmed" if status == "VALID" else "Action Needed to Complete Verification"
     what_happened = raw_message
@@ -78,12 +77,10 @@ def _build_message_spotlight(status, raw_message):
 
 
 def render_results(fields, assessment):
-    # Only the validator's explicit binary status can reach the result badge.
     status = assessment.get("status")
     status = status if status in STATUS_STYLES else "NOT VALID"
     color, background = STATUS_STYLES[status]
 
-    # Get the primary message cleanly without duplication
     raw_message = (
         assessment.get("message")
         or "The licence could not be screened. Upload a clearer image showing the licence details and validity information."
@@ -134,19 +131,6 @@ def validate_licence(image):
         })
 
     fields, annotated, assessment = process_driving_license(image)
-
-    print("\n--- DATE EXTRACTION DEBUG ---")
-    print("Full OCR:", fields.get("Full Image OCR"))
-    print("Detected dates:", fields.get("Detected Dates"))
-    print("Validity categories:", fields.get("Validity Categories"))
-    print("NT expiry:", fields.get("Valid Till (NT)"))
-    print("TR expiry:", fields.get("Valid Till (TR)"))
-    print("Date of issue:", fields.get("Date of Issue"))
-    print("Field review:", fields.get("Field Review"))
-    print("Reason codes:", assessment.get("reason_codes"))
-    print("Assessment:", assessment.get("message"))
-    print("--- END DEBUG ---\n")
-
     return annotated, render_results(fields, assessment)
 
 
