@@ -2,7 +2,7 @@ import html
 import os
 import re
 
-# Lock CPU thread pools and Paddle memory arenas before importing inference (PyTorch/PaddleOCR)
+# Lock CPU thread pools, proxy bypass, and Paddle memory arenas before importing inference
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -13,11 +13,13 @@ os.environ["FLAGS_allocator_strategy"] = "auto_growth"
 os.environ["FLAGS_fraction_of_cpu_memory_to_use"] = "0.6"
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["NO_PROXY"] = "localhost,127.0.0.1,0.0.0.0"
+os.environ["no_proxy"] = "localhost,127.0.0.1,0.0.0.0"
 
 import gradio as gr
 import gradio_client.utils as _client_utils
 
-# Defensive fix for Gradio 4.x + Pydantic 2.10+ boolean JSON schema crash on Render
+# Safeguard against Gradio 4.x + Pydantic 2.x boolean JSON schema TypeError on /info
 _orig_get_type = _client_utils.get_type
 _orig_json_schema_to_python_type = _client_utils._json_schema_to_python_type
 
@@ -171,8 +173,11 @@ def validate_uploaded_licence(image, reverse_image, category):
     return validate_licence({"front": image, "back": reverse_image, "category": category})
 
 
-def clear_licence():
-    # Returns 5 values matching [image_input, annotated_output, results, reverse_input, category_input]
+def reset_preview(*_args):
+    return None, ""
+
+
+def clear_licence(*_args):
     return None, None, "", None, "Automatic"
 
 
@@ -854,14 +859,14 @@ with gr.Blocks(
     )
 
     image_input.upload(
-        fn=lambda: (None, ""),
-        inputs=[],
+        fn=reset_preview,
+        inputs=[image_input],
         outputs=[annotated_output, results],
         queue=False,
     )
     reverse_input.upload(
-        fn=lambda: (None, ""),
-        inputs=[],
+        fn=reset_preview,
+        inputs=[reverse_input],
         outputs=[annotated_output, results],
         queue=False,
     )
@@ -899,5 +904,4 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=port,
         share=False,
-        show_api=False,
     )
