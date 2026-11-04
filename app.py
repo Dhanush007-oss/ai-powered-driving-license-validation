@@ -2,7 +2,40 @@ import html
 import os
 import re
 
+# Lock CPU thread pools and Paddle memory arenas before importing inference (PyTorch/PaddleOCR)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["FLAGS_num_threads"] = "1"
+os.environ["FLAGS_allocator_strategy"] = "auto_growth"
+os.environ["FLAGS_fraction_of_cpu_memory_to_use"] = "0.6"
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
 import gradio as gr
+import gradio_client.utils as _client_utils
+
+# Defensive fix for Gradio 4.x + Pydantic 2.10+ boolean JSON schema crash on Render
+_orig_get_type = _client_utils.get_type
+_orig_json_schema_to_python_type = _client_utils._json_schema_to_python_type
+
+
+def _safe_get_type(schema):
+    if isinstance(schema, bool):
+        return "Any"
+    return _orig_get_type(schema)
+
+
+def _safe_json_schema_to_python_type(schema, defs=None):
+    if isinstance(schema, bool):
+        return "Any"
+    return _orig_json_schema_to_python_type(schema, defs)
+
+
+_client_utils.get_type = _safe_get_type
+_client_utils._json_schema_to_python_type = _safe_json_schema_to_python_type
 
 from inference import DISPLAY_FIELDS, normalize_field_value, process_driving_license
 
@@ -139,7 +172,8 @@ def validate_uploaded_licence(image, reverse_image, category):
 
 
 def clear_licence():
-    return None, None, ""
+    # Returns 5 values matching [image_input, annotated_output, results, reverse_input, category_input]
+    return None, None, "", None, "Automatic"
 
 
 CUSTOM_CSS = """
@@ -818,20 +852,26 @@ with gr.Blocks(
         inputs=[image_input, reverse_input, category_input],
         outputs=[annotated_output, results],
     )
-    image_input.change(
+
+    image_input.upload(
         fn=lambda: (None, ""),
         inputs=[],
         outputs=[annotated_output, results],
         queue=False,
     )
-    reverse_input.change(fn=lambda: (None, ""), inputs=[], outputs=[annotated_output, results], queue=False)
-    category_input.change(fn=lambda: (None, ""), inputs=[], outputs=[annotated_output, results], queue=False)
+    reverse_input.upload(
+        fn=lambda: (None, ""),
+        inputs=[],
+        outputs=[annotated_output, results],
+        queue=False,
+    )
+
     clear.click(
         fn=clear_licence,
         inputs=[],
-        outputs=[image_input, annotated_output, results],
+        outputs=[image_input, annotated_output, results, reverse_input, category_input],
         queue=False,
-    ).then(fn=lambda: (None, "Automatic"), inputs=[], outputs=[reverse_input, category_input], queue=False)
+    )
 
     if os.path.exists(SAMPLE_LICENCE):
         gr.Examples(
@@ -853,9 +893,11 @@ with gr.Blocks(
         elem_id="site-footer",
     )
 
-
-import os
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port, share=False)
+    demo.queue(max_size=10).launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=False,
+        show_api=False,
+    )
