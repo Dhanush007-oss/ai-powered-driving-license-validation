@@ -1,8 +1,14 @@
+import ctypes
+import gc
 import html
 import os
 import re
+import threading
+import time
 
-# Lock CPU thread pools, proxy bypass, and Paddle memory arenas before importing inference
+# Set writable /tmp cache directories and lock CPU/RAM arenas before importing inference
+os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
+os.environ["YOLO_CONFIG_DIR"] = "/tmp/Ultralytics"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -10,7 +16,8 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["FLAGS_num_threads"] = "1"
 os.environ["FLAGS_allocator_strategy"] = "auto_growth"
-os.environ["FLAGS_fraction_of_cpu_memory_to_use"] = "0.6"
+os.environ["FLAGS_fraction_of_cpu_memory_to_use"] = "0.5"
+os.environ["MALLOC_TRIM_THRESHOLD_"] = "65536"
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["NO_PROXY"] = "localhost,127.0.0.1,0.0.0.0"
@@ -39,7 +46,13 @@ def _safe_json_schema_to_python_type(schema, defs=None):
 _client_utils.get_type = _safe_get_type
 _client_utils._json_schema_to_python_type = _safe_json_schema_to_python_type
 
-from inference import DISPLAY_FIELDS, normalize_field_value, process_driving_license
+from inference import (
+    DISPLAY_FIELDS,
+    get_ocr,
+    load_license_model,
+    normalize_field_value,
+    process_driving_license,
+)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_LICENCE = os.path.join(APP_DIR, "samples", "driving_license_front.jpg")
@@ -48,6 +61,26 @@ STATUS_STYLES = {
     "VALID": ("#d7ffe8", "linear-gradient(135deg, #0d7a4f, #14b8a6)"),
     "NOT VALID": ("#ffe4e6", "linear-gradient(135deg, #9f1239, #ea580c)"),
 }
+
+
+def _release_memory():
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _background_warmup():
+    """Warm up YOLO and PaddleOCR after port 10000 binds so the first user click is fast."""
+    time.sleep(2.0)
+    try:
+        load_license_model()
+        get_ocr()
+    except Exception:
+        pass
+    finally:
+        _release_memory()
 
 
 def _format_links(text):
@@ -165,8 +198,12 @@ def validate_licence(image):
             "message": "NOT VALID | Error (Image Not Uploaded): No driving licence photo was uploaded. | How to fix: Upload a clear, upright horizontal photo of your driving licence, including the side showing its validity date.",
         })
 
-    fields, annotated, assessment = process_driving_license(image)
-    return annotated, render_results(fields, assessment)
+    _release_memory()
+    try:
+        fields, annotated, assessment = process_driving_license(image)
+        return annotated, render_results(fields, assessment)
+    finally:
+        _release_memory()
 
 
 def validate_uploaded_licence(image, reverse_image, category):
@@ -178,6 +215,7 @@ def reset_preview(*_args):
 
 
 def clear_licence(*_args):
+    _release_memory()
     return None, None, "", None, "Automatic"
 
 
@@ -899,8 +937,9 @@ with gr.Blocks(
     )
 
 if __name__ == "__main__":
+    threading.Thread(target=_background_warmup, daemon=True).start()
     port = int(os.environ.get("PORT", 7860))
-    demo.queue(max_size=10).launch(
+    demo.queue(max_size=10, default_concurrency_limit=1).launch(
         server_name="0.0.0.0",
         server_port=port,
         share=False,

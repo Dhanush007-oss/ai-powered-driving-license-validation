@@ -1,3 +1,5 @@
+import ctypes
+import gc
 import json
 import logging
 import os
@@ -14,6 +16,7 @@ import numpy as np
 import torch  # noqa: F401  # load torch DLLs before PaddleOCR on Windows
 from huggingface_hub import hf_hub_download
 import warnings
+
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"paddle\..*")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"google\.protobuf\..*")
 
@@ -134,7 +137,17 @@ PADDLEOCR_VL_PYTHON = (
 )
 PADDLEOCR_VL_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paddleocr_vl_worker.py")
 
-MAX_PROCESSING_DIMENSION = 2000
+IS_RENDER_CLOUD = bool(os.environ.get("RENDER") or os.environ.get("PORT"))
+MAX_PROCESSING_DIMENSION = 960 if IS_RENDER_CLOUD else 2000
+
+
+def _trim_memory():
+    gc.collect()
+    if IS_RENDER_CLOUD:
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
 
 def normalize_field_value(value):
@@ -282,6 +295,8 @@ def _date_candidates_for_lines(recognized_lines):
 
 def _should_run_paddleocr_vl(fields, assessment):
     """Run PaddleOCR-VL only when its local runtime exists and expiry fields need resolution."""
+    if IS_RENDER_CLOUD:
+        return False
     if not (os.path.isfile(PADDLEOCR_VL_PYTHON) and os.path.isfile(PADDLEOCR_VL_WORKER)):
         return False
     if assessment.get("status") == "VALID":
@@ -341,13 +356,19 @@ def get_ocr():
         if _OCR is None:
             try:
                 _OCR = PaddleOCR(
-                    use_angle_cls=True,
+                    use_angle_cls=not IS_RENDER_CLOUD,
                     lang="en",
                     show_log=False,
                     enable_mkldnn=False,
+                    det_limit_side_len=960 if IS_RENDER_CLOUD else 1280,
+                    rec_batch_num=2 if IS_RENDER_CLOUD else 6,
                 )
             except TypeError:
-                _OCR = PaddleOCR(lang="en")
+                _OCR = PaddleOCR(
+                    use_angle_cls=not IS_RENDER_CLOUD,
+                    lang="en",
+                    show_log=False,
+                )
         return _OCR
 
 
@@ -381,9 +402,13 @@ def cap_image_resolution(image, max_dim=MAX_PROCESSING_DIMENSION):
 
 def upscale_image(image, scale=2):
     h, w = image.shape[:2]
-    if max(h, w) >= 1600:
+    max_limit = 800 if IS_RENDER_CLOUD else 1600
+    if max(h, w) >= max_limit:
         return image
-    return cv2.resize(image, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+    eff_scale = 1 if (IS_RENDER_CLOUD and max(h, w) >= 360) else scale
+    if eff_scale <= 1:
+        return image
+    return cv2.resize(image, (w * eff_scale, h * eff_scale), interpolation=cv2.INTER_CUBIC)
 
 
 def unblur_image(image):
@@ -404,14 +429,15 @@ def enhance_contrast(image):
 
 
 def preprocess_image(image):
-    bounded = cap_image_resolution(image, max_dim=1200)
+    bounded = cap_image_resolution(image, max_dim=960 if IS_RENDER_CLOUD else 1200)
     h, w = bounded.shape[:2]
-    if max(h, w) < 900:
+    if not IS_RENDER_CLOUD and max(h, w) < 900:
         image = upscale_image(bounded, scale=2)
     else:
         image = bounded
     image = unblur_image(image)
-    image = denoise_image(image)
+    if not IS_RENDER_CLOUD:
+        image = denoise_image(image)
     image = enhance_contrast(image)
     return image
 
@@ -619,7 +645,8 @@ def read_ocr_lines(image):
 
     image_height, image_width = image.shape[:2]
     with _OCR_LOCK:
-        ocr_result = get_ocr().ocr(image, cls=True)
+        ocr_result = get_ocr().ocr(image, cls=not IS_RENDER_CLOUD)
+    _trim_memory()
     if not ocr_result:
         return []
 
@@ -929,8 +956,8 @@ def read_vertical_issue_fields(image):
     return output
 
 
-def extract_license_ocr_fields(image):
-    recognized_lines = read_ocr_lines(image)
+def extract_license_ocr_fields(image, precomputed_lines=None):
+    recognized_lines = precomputed_lines if precomputed_lines is not None else read_ocr_lines(image)
     output_fields = extract_labelled_fields(recognized_lines)
     output_fields["Full Image OCR"] = " | ".join(line["text"] for line in recognized_lines)
     output_fields["OCR Detections"] = recognized_lines
@@ -949,7 +976,7 @@ def extract_license_ocr_fields(image):
         and not (category == "TR" and re.search(r"\bNON[ -]*TRANSPORT\b", line["text"], re.I))
     })
 
-    # PIPELINE FIX: Only invoke 4-strip vertical edge OCR when "Date of Issue" itself is missing
+    # Only invoke 4-strip vertical edge OCR when "Date of Issue" itself is missing
     if not output_fields.get("Date of Issue"):
         try:
             vertical = read_vertical_issue_fields(image)
@@ -986,6 +1013,18 @@ def extract_license_ocr_fields(image):
             else:
                 output_fields["TR Expiry Review"] = review
                 output_fields.setdefault("Field Review", []).append(review)
+
+    # Fix blank Validity (TR) template header on standard NT licences:
+    # If NT expiry is found and TR has neither a date nor a review conflict, TR is just a blank template column.
+    if (
+        output_fields.get("Valid Till (NT)")
+        and not output_fields.get("Valid Till (TR)")
+        and not output_fields.get("TR Expiry Review")
+        and "TR" in output_fields.get("Validity Categories", [])
+    ):
+        output_fields["Validity Categories"] = [
+            cat for cat in output_fields["Validity Categories"] if cat != "TR"
+        ]
 
     # Universal Fallback: Map generic Valid Till or remaining post-issue date to Valid Till (NT)
     if not output_fields.get("Valid Till (NT)") and not output_fields.get("Valid Till (TR)"):
@@ -1058,13 +1097,28 @@ def assess_licence(fields, today=None):
     return evaluate_licence_validation(fields, today=today, DL_NUMBER_PATTERN=DL_NUMBER_PATTERN)
 
 
+def _lines_inside_box(recognized_lines, x_min, y_min, x_max, y_max, img_w, img_h):
+    """Find full-image OCR lines whose center falls inside a YOLO bounding box."""
+    matched = []
+    pad_x = max(6, int(0.015 * img_w))
+    pad_y = max(6, int(0.015 * img_h))
+    for line in recognized_lines:
+        cx = line["x"] * img_w
+        cy = line["y"] * img_h
+        if (x_min - pad_x) <= cx <= (x_max + pad_x) and (y_min - pad_y) <= cy <= (y_max + pad_y):
+            matched.append(line)
+    return matched
+
+
 def _process_licence_image(image_input):
     image = image_input if (isinstance(image_input, np.ndarray) and image_input.ndim == 3) else read_image(image_input)
     model = load_license_model()
     cfg = load_config()
     class_names = cfg["models"]["Driving_License"]["classes"]
-    with _MODEL_LOCK:
-        results = model(image)
+    with _MODEL_LOCK, torch.inference_mode():
+        results = model(image, imgsz=640, verbose=False)
+    _trim_memory()
+
     output_image = image.copy()
     h, w, _ = output_image.shape
     filtered_boxes = {}
@@ -1082,8 +1136,15 @@ def _process_licence_image(image_input):
             if cls not in filtered_boxes or conf > filtered_boxes[cls]["conf"]:
                 filtered_boxes[cls] = {"conf": conf, "xyxy": xyxy, "class_name": class_name}
 
-    # PIPELINE FIX: Batch initial clean_crop reads onto a single composite canvas,
-    # while preserving per-crop preprocess_image() fallback if any crop is blank.
+    # Run full-image OCR once so we can also reuse its spatial lines for cloud crops
+    full_image_lines = []
+    full_image_fields = {}
+    try:
+        full_image_lines = read_ocr_lines(image)
+        full_image_fields = extract_license_ocr_fields(image, precomputed_lines=full_image_lines)
+    except Exception:
+        logger.exception("Full-image licence OCR failed")
+
     crop_entries = []
     gap = 24
     max_crop_w = 1
@@ -1095,11 +1156,29 @@ def _process_licence_image(image_input):
         x_min, y_min = max(0, x_min), max(0, y_min)
         x_max, y_max = min(w, x_max), min(h, y_max)
 
-        # Expand horizontal crop margin slightly for DL No so leading state letters (e.g., 'DL') are never clipped
+        # Expand horizontal crop margin slightly for DL No so leading state letters are never clipped
         crop_x_min = max(0, x_min - int(0.08 * w)) if class_name == "DL No" else x_min
         crop_x_max = min(w, x_max + int(0.04 * w)) if class_name == "DL No" else x_max
         region_img = image[y_min:y_max, crop_x_min:crop_x_max]
         if region_img.size == 0:
+            continue
+
+        # On Render cloud, reuse already-recognized full-image lines if they cleanly cover this YOLO box
+        prematched_lines = (
+            _lines_inside_box(full_image_lines, crop_x_min, y_min, crop_x_max, y_max, w, h)
+            if IS_RENDER_CLOUD and full_image_lines
+            else []
+        )
+        if IS_RENDER_CLOUD and prematched_lines:
+            crop_entries.append({
+                "class_name": class_name,
+                "xyxy": (x_min, y_min, x_max, y_max),
+                "region_img": region_img,
+                "clean_crop": None,
+                "top_px": -1,
+                "bottom_px": -1,
+                "crop_lines": prematched_lines,
+            })
             continue
 
         clean_crop = cv2.copyMakeBorder(
@@ -1127,10 +1206,12 @@ def _process_licence_image(image_input):
             "crop_lines": [],
         })
 
-    if crop_entries:
+    if total_canvas_h > 0:
         canvas = np.full((total_canvas_h, max_crop_w, 3), 255, dtype=np.uint8)
         for entry in crop_entries:
             crop = entry["clean_crop"]
+            if crop is None:
+                continue
             ch, cw = crop.shape[:2]
             canvas[entry["top_px"]:entry["top_px"] + ch, :cw] = crop
 
@@ -1142,7 +1223,7 @@ def _process_licence_image(image_input):
         for line in all_canvas_lines:
             y_px = line["y"] * total_canvas_h
             for entry in crop_entries:
-                if entry["top_px"] <= y_px <= entry["bottom_px"]:
+                if entry["top_px"] >= 0 and entry["top_px"] <= y_px <= entry["bottom_px"]:
                     entry["crop_lines"].append(line)
                     break
 
@@ -1153,7 +1234,7 @@ def _process_licence_image(image_input):
         region_img = entry["region_img"]
         crop_lines = entry["crop_lines"]
 
-        if not crop_lines:
+        if not crop_lines and not (IS_RENDER_CLOUD and full_image_fields.get(class_name)):
             filtered_crop = cv2.copyMakeBorder(
                 preprocess_image(region_img),
                 12,
@@ -1170,15 +1251,21 @@ def _process_licence_image(image_input):
         if class_name == "Blood Group":
             bg_match = VALID_BLOOD_GROUP_PATTERN.search(raw_text)
             if not bg_match:
+                cv2.rectangle(output_image, (x_min, y_min), (x_max, y_max), (46, 184, 107), 2)
+                cv2.putText(output_image, class_name, (x_min, max(18, y_min - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (36, 99, 235), 2)
                 continue
             raw_text = re.sub(r"\s+", "", bg_match.group(1).upper())
 
         elif class_name in ("DOB", "Date of Issue", "Date of First Issue", "Valid Till", "Valid Till (NT)", "Valid Till (TR)"):
             date_m = DATE_PATTERN.search(raw_text)
             if not date_m:
+                cv2.rectangle(output_image, (x_min, y_min), (x_max, y_max), (46, 184, 107), 2)
+                cv2.putText(output_image, class_name, (x_min, max(18, y_min - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (36, 99, 235), 2)
                 continue
             parsed_d = parse_licence_date(date_m.group(1))
             if not parsed_d:
+                cv2.rectangle(output_image, (x_min, y_min), (x_max, y_max), (46, 184, 107), 2)
+                cv2.putText(output_image, class_name, (x_min, max(18, y_min - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (36, 99, 235), 2)
                 continue
             raw_text = parsed_d.strftime("%d-%m-%Y")
 
@@ -1224,8 +1311,7 @@ def _process_licence_image(image_input):
             2,
         )
 
-    try:
-        full_image_fields = extract_license_ocr_fields(image)
+    if full_image_fields:
         crop_confidence = detected_text.get("Field Confidence", {})
         for k, v in full_image_fields.pop("Field Confidence", {}).items():
             if v is not None:
@@ -1247,21 +1333,35 @@ def _process_licence_image(image_input):
             if v or k not in detected_text or not detected_text.get(k):
                 detected_text[k] = v
         detected_text["Field Confidence"] = crop_confidence
-    except Exception:
-        logger.exception("Full-image licence OCR failed")
+
+    # Remove stale Field Review warnings if a field was validly resolved by crop or full-image OCR
+    if detected_text.get("Field Review"):
+        detected_text["Field Review"] = [
+            note for note in detected_text["Field Review"]
+            if not any(
+                str(note).startswith(f"{fname}:") and normalize_field_value(detected_text.get(fname))
+                for fname in ("DL No", "Name", "DOB", "Date of Issue", "Valid Till")
+            )
+        ]
 
     # Ensure generic "Valid Till" never duplicates DOB/Date of Issue and syncs with NT/TR expiry
-    if detected_text.get("Valid Till") in {detected_text.get("DOB"), detected_text.get("Date of Issue"), detected_text.get("Date of First Issue")}:
+    if detected_text.get("Valid Till") in {
+        detected_text.get("DOB"),
+        detected_text.get("Date of Issue"),
+        detected_text.get("Date of First Issue"),
+    }:
         detected_text["Valid Till"] = ""
     if not detected_text.get("Valid Till"):
         detected_text["Valid Till"] = detected_text.get("Valid Till (NT)") or detected_text.get("Valid Till (TR)", "")
-        state_extracted = (
+
+    state_extracted = (
         extract_state(detected_text.get("State", ""))
         or extract_state(detected_text.get("Address", ""))
         or extract_state(detected_text.get("Full Image OCR", ""))
     )
     detected_text["State"] = state_extracted
     annotated_rgb = cv2.cvtColor(output_image, cv2.COLOR_BGR2RGB)
+    _trim_memory()
     return detected_text, annotated_rgb
 
 
@@ -1454,6 +1554,7 @@ def process_driving_license(image_input, save_json=False, output_json="detected_
     if save_json:
         with open(output_json, "w", encoding="utf-8") as output:
             json.dump(fields, output, indent=4, cls=_SafeJSONEncoder)
+    _trim_memory()
     return fields, annotated, assessment
 
 
