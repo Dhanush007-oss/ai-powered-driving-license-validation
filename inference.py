@@ -20,9 +20,6 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"paddle\..*")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"google\.protobuf\..*")
 
-from paddleocr import PaddleOCR
-from ultralytics import YOLO
-
 from validation_rules import (
     PARIVAHAN_PORTAL_URL,
     check_image_quality,
@@ -138,7 +135,7 @@ PADDLEOCR_VL_PYTHON = (
 PADDLEOCR_VL_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paddleocr_vl_worker.py")
 
 IS_RENDER_CLOUD = bool(os.environ.get("RENDER") or os.environ.get("PORT"))
-MAX_PROCESSING_DIMENSION = 960 if IS_RENDER_CLOUD else 2000
+MAX_PROCESSING_DIMENSION = 800 if IS_RENDER_CLOUD else 2000
 
 
 def _trim_memory():
@@ -354,14 +351,17 @@ def get_ocr():
     global _OCR
     with _OCR_LOCK:
         if _OCR is None:
+            from paddleocr import PaddleOCR
+
+            _trim_memory()
             try:
                 _OCR = PaddleOCR(
                     use_angle_cls=not IS_RENDER_CLOUD,
                     lang="en",
                     show_log=False,
                     enable_mkldnn=False,
-                    det_limit_side_len=960 if IS_RENDER_CLOUD else 1280,
-                    rec_batch_num=2 if IS_RENDER_CLOUD else 6,
+                    det_limit_side_len=800 if IS_RENDER_CLOUD else 1280,
+                    rec_batch_num=1 if IS_RENDER_CLOUD else 6,
                 )
             except TypeError:
                 _OCR = PaddleOCR(
@@ -369,6 +369,7 @@ def get_ocr():
                     lang="en",
                     show_log=False,
                 )
+            _trim_memory()
         return _OCR
 
 
@@ -378,6 +379,9 @@ def load_license_model():
         if _LICENSE_MODEL is not None:
             return _LICENSE_MODEL
 
+        from ultralytics import YOLO
+
+        _trim_memory()
         cfg = load_config()
         model_path = cfg["models"]["Driving_License"]["path"]
         local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), model_path)
@@ -386,6 +390,7 @@ def load_license_model():
         else:
             model_path = hf_hub_download(repo_id=HF_REPO, filename=model_path)
         _LICENSE_MODEL = YOLO(model_path)
+        _trim_memory()
         return _LICENSE_MODEL
 
 
@@ -429,7 +434,7 @@ def enhance_contrast(image):
 
 
 def preprocess_image(image):
-    bounded = cap_image_resolution(image, max_dim=960 if IS_RENDER_CLOUD else 1200)
+    bounded = cap_image_resolution(image, max_dim=800 if IS_RENDER_CLOUD else 1200)
     h, w = bounded.shape[:2]
     if not IS_RENDER_CLOUD and max(h, w) < 900:
         image = upscale_image(bounded, scale=2)
@@ -1111,30 +1116,35 @@ def _lines_inside_box(recognized_lines, x_min, y_min, x_max, y_max, img_w, img_h
 
 
 def _process_licence_image(image_input):
+    global _LICENSE_MODEL
     image = image_input if (isinstance(image_input, np.ndarray) and image_input.ndim == 3) else read_image(image_input)
-    model = load_license_model()
     cfg = load_config()
     class_names = cfg["models"]["Driving_License"]["classes"]
+    filtered_boxes = {}
+
     with _MODEL_LOCK, torch.inference_mode():
+        model = load_license_model()
         results = model(image, imgsz=640, verbose=False)
+        for result in results:
+            if not result.boxes:
+                continue
+            for box in result.boxes:
+                cls = int(box.cls[0].item())
+                if cls >= len(class_names):
+                    continue
+                conf = float(box.conf[0].item())
+                xyxy = box.xyxy[0].tolist()
+                class_name = class_names[cls]
+                if cls not in filtered_boxes or conf > filtered_boxes[cls]["conf"]:
+                    filtered_boxes[cls] = {"conf": conf, "xyxy": xyxy, "class_name": class_name}
+        del results
+        if IS_RENDER_CLOUD:
+            # Unload YOLO from RAM before PaddleOCR runs so peak memory stays safely under 512MB
+            _LICENSE_MODEL = None
     _trim_memory()
 
     output_image = image.copy()
     h, w, _ = output_image.shape
-    filtered_boxes = {}
-
-    for result in results:
-        if not result.boxes:
-            continue
-        for box in result.boxes:
-            cls = int(box.cls[0].item())
-            if cls >= len(class_names):
-                continue
-            conf = float(box.conf[0].item())
-            xyxy = box.xyxy[0].tolist()
-            class_name = class_names[cls]
-            if cls not in filtered_boxes or conf > filtered_boxes[cls]["conf"]:
-                filtered_boxes[cls] = {"conf": conf, "xyxy": xyxy, "class_name": class_name}
 
     # Run full-image OCR once so we can also reuse its spatial lines for cloud crops
     full_image_lines = []

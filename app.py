@@ -3,11 +3,10 @@ import gc
 import html
 import os
 import re
-import threading
-import time
 
 # Set writable /tmp cache directories and lock CPU/RAM arenas before importing inference
 os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
+os.environ["MPLBACKEND"] = "Agg"
 os.environ["YOLO_CONFIG_DIR"] = "/tmp/Ultralytics"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -48,8 +47,6 @@ _client_utils._json_schema_to_python_type = _safe_json_schema_to_python_type
 
 from inference import (
     DISPLAY_FIELDS,
-    get_ocr,
-    load_license_model,
     normalize_field_value,
     process_driving_license,
 )
@@ -69,18 +66,6 @@ def _release_memory():
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
-
-
-def _background_warmup():
-    """Warm up YOLO and PaddleOCR after port 10000 binds so the first user click is fast."""
-    time.sleep(2.0)
-    try:
-        load_license_model()
-        get_ocr()
-    except Exception:
-        pass
-    finally:
-        _release_memory()
 
 
 def _format_links(text):
@@ -937,7 +922,6 @@ with gr.Blocks(
     )
 
 if __name__ == "__main__":
-    threading.Thread(target=_background_warmup, daemon=True).start()
     port = int(os.environ.get("PORT", 7860))
     demo.queue(max_size=10, default_concurrency_limit=1).launch(
         server_name="0.0.0.0",
